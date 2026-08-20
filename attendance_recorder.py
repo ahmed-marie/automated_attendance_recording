@@ -220,7 +220,6 @@ def ask_end_session_params(parent, title, initial_instructor="", initial_hall=No
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.withdraw()  # hide until setup is resolved
 
         db.init_db(DB_FILE)
         self.student_db = load_student_database()
@@ -229,6 +228,7 @@ class App(tk.Tk):
         if cfg is None:
             cfg = ask_first_run_setup(self)
             if not cfg:
+                messagebox.showinfo("Setup cancelled", "Setup was cancelled -- the application will now close.")
                 self.destroy()
                 return
             save_device_config(cfg)
@@ -239,7 +239,6 @@ class App(tk.Tk):
         self.sync_server = sync.start_server(DB_FILE, self.device_info, port=sync.DEFAULT_PORT)
         self.sync_manager = sync.SyncManager(DB_FILE)
 
-        self.deiconify()
         self.title(f"Card Attendance Recorder -- {self.ta_name}")
         self.geometry("820x640")
 
@@ -684,4 +683,5 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     app = App()
-    app.mainloop()
+    if app.winfo_exists():
+        app.mainloop()
