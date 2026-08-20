@@ -38,7 +38,7 @@ Files used/created next to this script:
     roster.json             -- uid -> {student_id, name, faculty}   (this course's enrolled cards)
     session_state.json      -- today's session counter + any active session
     attendance_logger.xlsx  -- raw scan log, one sheet per date, columns:
-        Time | UID | Student ID | Name | Session ID | Hall Number | TA Name | Duration (min)
+        Time | UID | Student ID | Name | Faculty | Session ID | Hall Number | TA Name | Duration (min)
 """
 
 import tkinter as tk
@@ -69,8 +69,8 @@ FACULTY_LIST = [
 ]
 
 # Column layout used in attendance_logger.xlsx (1-based, for openpyxl cells)
-COL_TIME, COL_UID, COL_STUDENT_ID, COL_NAME = 1, 2, 3, 4
-COL_SESSION_ID, COL_HALL, COL_TA, COL_DURATION = 5, 6, 7, 8
+COL_TIME, COL_UID, COL_STUDENT_ID, COL_NAME, COL_FACULTY = 1, 2, 3, 4, 5
+COL_SESSION_ID, COL_HALL, COL_TA, COL_DURATION = 6, 7, 8, 9
 
 
 def extract_uid(raw_scan):
@@ -230,9 +230,9 @@ class App(tk.Tk):
 
         self._build_attendance_tab()
         self._build_enroll_tab()
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         self._update_session_ui()
-        self.after(300, self._refocus)
 
         if not self.student_db:
             messagebox.showinfo(
@@ -301,13 +301,14 @@ class App(tk.Tk):
         entry = self.roster.get(uid, {})
         student_id = entry.get("student_id", "")
         name = entry.get("name", "UNKNOWN CARD")
+        faculty = entry.get("faculty", "")
         session_id = self.active_session["session_id"]
 
         line = f"{now.strftime('%H:%M:%S')}   {uid}   {student_id:<10}   {name:<20}   [{session_id}]"
         self.att_log.insert(0, line)
 
         try:
-            self._append_attendance_row(now, uid, student_id, name, session_id)
+            self._append_attendance_row(now, uid, student_id, name, faculty, session_id)
         except PermissionError:
             messagebox.showerror(
                 "File is open",
@@ -315,7 +316,7 @@ class App(tk.Tk):
                 "Close it and the next scan will save normally.",
             )
 
-    def _append_attendance_row(self, ts, uid, student_id, name, session_id):
+    def _append_attendance_row(self, ts, uid, student_id, name, faculty, session_id):
         if os.path.exists(ATTENDANCE_FILE):
             wb = openpyxl.load_workbook(ATTENDANCE_FILE)
         else:
@@ -325,15 +326,17 @@ class App(tk.Tk):
         sheet_name = ts.strftime("%Y-%m-%d")
         if sheet_name not in wb.sheetnames:
             ws = wb.create_sheet(sheet_name)
-            ws.append(["Time", "UID", "Student ID", "Name", "Session ID", "Hall Number", "TA Name", "Duration (min)"])
-            widths = {"A": 12, "B": 14, "C": 14, "D": 30, "E": 16, "F": 14, "G": 20, "H": 16}
+            ws.append(
+                ["Time", "UID", "Student ID", "Name", "Faculty", "Session ID", "Hall Number", "TA Name", "Duration (min)"]
+            )
+            widths = {"A": 12, "B": 14, "C": 14, "D": 30, "E": 26, "F": 16, "G": 14, "H": 20, "I": 16}
             for col, width in widths.items():
                 ws.column_dimensions[col].width = width
         else:
             ws = wb[sheet_name]
 
         # Hall Number / TA Name / Duration are filled in later, at "End Session".
-        ws.append([ts.strftime("%H:%M:%S"), uid, student_id, name, session_id, None, None, None])
+        ws.append([ts.strftime("%H:%M:%S"), uid, student_id, name, faculty, session_id, None, None, None])
         wb.save(ATTENDANCE_FILE)
 
     def _apply_session_metadata(self, session_id, hall, instructor, duration):
@@ -551,21 +554,19 @@ class App(tk.Tk):
             )
 
     # ---------------- Focus management ----------------
-    def _refocus(self):
+    # Focus is set explicitly right after actions that need it (a scan
+    # processed, a session started, a tab switched) instead of a recurring
+    # timer -- a polling timer was fighting with the Hall/Faculty dropdowns,
+    # yanking focus back and closing them before a click could register.
+    def _on_tab_changed(self, event=None):
         try:
             current_tab = self.nametowidget(self.notebook.select())
-            focused = self.focus_get()
-
-            if current_tab == self.attendance_tab:
-                if str(self.att_entry.cget("state")) == "normal" and focused != self.att_entry:
-                    self.att_entry.focus_set()
+            if current_tab == self.attendance_tab and str(self.att_entry.cget("state")) == "normal":
+                self.att_entry.focus_set()
             elif current_tab == self.enroll_tab:
-                capture_boxes = (self.enroll_uid_entry, self.enroll_id_entry, self.enroll_name_entry, self.enroll_faculty_combo)
-                if focused not in capture_boxes:
-                    self.enroll_uid_entry.focus_set()
+                self.enroll_uid_entry.focus_set()
         except Exception:
             pass
-        self.after(300, self._refocus)
 
 
 if __name__ == "__main__":

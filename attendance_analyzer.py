@@ -8,7 +8,7 @@ attendance_logger.xlsx). This script is then run ONCE, by the lecturer or a
 senior TA, on that merged file to produce the day's attendance report.
 
 Merged file columns (per scan row):
-    Time | UID | Student ID | Name | Session ID | Hall Number | TA Name | Duration (min)
+    Time | UID | Student ID | Name | Faculty | Session ID | Hall Number | TA Name | Duration (min)
 
 Status rules, evaluated per (student, session_id) -- note the SAME session_id
 can legitimately appear under multiple Hall Numbers (each hall runs its own
@@ -81,8 +81,8 @@ def read_day_scans(recorder_path, date_str):
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row or row[0] is None:
             continue
-        padded = (row + (None,) * 8)[:8]
-        time_val, uid, student_id, name, session_id, hall, ta_name, duration = padded
+        padded = (row + (None,) * 9)[:9]
+        time_val, uid, student_id, name, faculty, session_id, hall, ta_name, duration = padded
         if uid is None or session_id is None:
             continue
         uid = str(uid).strip()
@@ -96,12 +96,15 @@ def read_day_scans(recorder_path, date_str):
 
         sess = sessions.setdefault(session_id, {})
         entry = sess.setdefault(
-            uid, {"student_id": student_id or "", "name": name or "", "times": [], "halls": set(), "durations": []}
+            uid,
+            {"student_id": student_id or "", "name": name or "", "faculty": faculty or "", "times": [], "halls": set(), "durations": []},
         )
         if student_id:
             entry["student_id"] = student_id
         if name and name != "UNKNOWN CARD":
             entry["name"] = name
+        if faculty:
+            entry["faculty"] = faculty
         entry["times"].append(ts)
         if hall:
             entry["halls"].add(hall)
