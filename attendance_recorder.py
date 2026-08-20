@@ -44,15 +44,28 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import json
 import os
+import sys
 from datetime import datetime
 
 import attendance_db as db
 import sync_service as sync
 
-DEVICE_CONFIG_FILE = "device_config.json"
-DB_FILE = db.DB_FILE
-ATTENDANCE_EXPORT_FILE = db.EXPORT_FILE
-STUDENT_DB_FILE = "students_database.db"
+
+def _app_dir():
+    """Folder the .exe (or .py, when not frozen) actually lives in -- NOT
+    whatever the current working directory happens to be at launch, which
+    can differ depending on how the app was started (double-click vs. a
+    shortcut with a different 'Start in' path vs. a terminal)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = _app_dir()
+DEVICE_CONFIG_FILE = os.path.join(APP_DIR, "device_config.json")
+DB_FILE = os.path.join(APP_DIR, db.DB_FILE)
+ATTENDANCE_EXPORT_FILE = os.path.join(APP_DIR, db.EXPORT_FILE)
+STUDENT_DB_FILE = os.path.join(APP_DIR, "students_database.db")
 DEBOUNCE_SECONDS = 3
 UID_LENGTH = 10
 TYPICAL_SESSION_RANGE = (45, 90)  # minutes; soft sanity check only
