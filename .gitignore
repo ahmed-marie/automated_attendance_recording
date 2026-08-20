@@ -6,6 +6,10 @@
 # Ignore JSON files used for session state and roster data (testing purposes)
 session_state.json
 roster.json
+device_config.json
+
+# Ignore database files used for session state and roster data (testing purposes)
+*.db
 
 
 # Byte-compiled / optimized / DLL files
