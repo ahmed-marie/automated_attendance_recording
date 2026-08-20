@@ -1,3 +1,13 @@
+# Project-specific ignores
+
+# Ignore Excel files and JSON files used for session state and roster data
+*.xlsx
+
+# Ignore JSON files used for session state and roster data (testing purposes)
+session_state.json
+roster.json
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
