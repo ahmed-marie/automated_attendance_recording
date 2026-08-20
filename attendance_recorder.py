@@ -1,31 +1,27 @@
 """
-Card Attendance Recorder  (Phase I - runs on each hall's PC during class)
+Card Attendance Recorder  (runs on each TA's laptop, synced live via LAN)
 ============================================================================
 Works with the OMNIKEY 5427 G2 in keyboard-emulation (HID) mode: the reader
 "types" an 18-character hex string + Enter into whatever window has focus.
-The first 8 characters change on every read; the last 10 are the card's
-fixed UID, so only the last 10 characters are kept.
+Only the last 10 characters (the fixed part) are kept as the card's UID.
 
-Two scanners per hall need NO special handling here: both are just
-keyboard-emulation devices sending keystrokes to whichever window/field is
-focused on this PC, so a student tapping in on one scanner and out on
-another still increments the same in/out count for that card.
+TWO LAPTOPS, ONE HALL
+----------------------
+Two TAs each run this app on their own laptop with their own scanner, both
+connected to the SAME mobile hotspot (a phone's hotspot, or a small travel
+router) -- a private link the two of you control, independent of the
+building's WiFi. Each laptop keeps a local SQLite database
+(attendance_local.db) and they sync with each other directly over that
+hotspot every ~12 seconds (or on demand via "Sync Now"), so both laptops
+converge on the same picture of who's in/out even though two independent
+scanners are recording it.
 
-Enroll Cards tab now looks students up in a university-provided roster
-(students_database.xlsx, columns: ID | Student Name | Faculty | ...) instead
-of requiring every one of ~400 students to be typed in by hand:
-    - Scan the card, type the printed Student ID, click Search (or press
-      Enter) -- if that ID is in the database, Name and Faculty are filled
-      in automatically.
-    - If the ID isn't found, Name is typed manually and Faculty is chosen
-      from the dropdown (both fields stay editable either way, so a
-      database hit can still be corrected before saving).
-
-This version writes a purely LOCAL log per hall/session -- it no longer
-generates the attendance report itself. Once class ends, this hall's
-attendance_logger.xlsx gets uploaded/merged with every other hall's file
-(e.g. via a shared Google Sheet), and attendance_analyzer.py is run ONCE
-on the merged file by the lecturer/senior TA (see that script's docstring).
+One laptop is the "Controller" (starts/ends sessions; this generates the
+Session ID both laptops end up sharing) and the other is the "Helper"
+(scans normally, learns the active session from the sync). Either laptop
+can flip the "This laptop controls sessions" checkbox -- e.g. if the
+Controller's laptop has a problem, the Helper ticks the box and takes over
+for the rest of the day.
 
 Requirements:
     pip install openpyxl
@@ -34,27 +30,33 @@ Usage:
     python attendance_recorder.py
 
 Files used/created next to this script:
-    students_database.xlsx -- university-provided roster (read-only input)
-    roster.json             -- uid -> {student_id, name, faculty}   (this course's enrolled cards)
-    session_state.json      -- today's session counter + any active session
-    attendance_logger.xlsx  -- raw scan log, one sheet per date, columns:
-        Time | UID | Student ID | Name | Faculty | Session ID | Hall Number | TA Name | Duration (min)
+    students_database.db   -- read-only university roster (build with
+                               build_student_database.py from the .xlsx
+                               the university sends)
+    attendance_local.db    -- this laptop's local database (roster/sessions/scans)
+    device_config.json     -- this laptop's saved TA name / role / port
+    attendance_logger.xlsx -- exported snapshot (auto-refreshed after each
+                              sync and after End Session) for the later,
+                              cross-hall merge + attendance_analyzer.py step
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 import json
 import os
 from datetime import datetime
-import openpyxl
 
-ROSTER_FILE = "roster.json"
-ATTENDANCE_FILE = "attendance_logger.xlsx"
-SESSION_STATE_FILE = "session_state.json"
-STUDENT_DB_FILE = "students_database.xlsx"
+import attendance_db as db
+import sync_service as sync
+
+DEVICE_CONFIG_FILE = "device_config.json"
+DB_FILE = db.DB_FILE
+ATTENDANCE_EXPORT_FILE = db.EXPORT_FILE
+STUDENT_DB_FILE = "students_database.db"
 DEBOUNCE_SECONDS = 3
 UID_LENGTH = 10
 TYPICAL_SESSION_RANGE = (45, 90)  # minutes; soft sanity check only
+SYNC_INTERVAL_SECONDS = 12
 
 # TODO: replace with the official list of halls once provided.
 HALL_LIST = ["Hall 1", "Hall 2", "Hall 3"]
@@ -68,10 +70,6 @@ FACULTY_LIST = [
     "Pharmaceutical Engineering",
 ]
 
-# Column layout used in attendance_logger.xlsx (1-based, for openpyxl cells)
-COL_TIME, COL_UID, COL_STUDENT_ID, COL_NAME, COL_FACULTY = 1, 2, 3, 4, 5
-COL_SESSION_ID, COL_HALL, COL_TA, COL_DURATION = 6, 7, 8, 9
-
 
 def extract_uid(raw_scan):
     raw_scan = raw_scan.strip().upper()
@@ -80,56 +78,80 @@ def extract_uid(raw_scan):
     return raw_scan
 
 
-def load_roster():
-    if os.path.exists(ROSTER_FILE):
-        with open(ROSTER_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def save_roster(roster):
-    with open(ROSTER_FILE, "w", encoding="utf-8") as f:
-        json.dump(roster, f, indent=2, ensure_ascii=False)
-
-
 def load_student_database(path=STUDENT_DB_FILE):
-    """Read the university-provided roster: ID | Student Name | Faculty | ...
-    Extra columns are ignored. Returns {student_id: {"name":.., "faculty":..}}."""
-    db = {}
+    """Read the university-provided roster from the read-only SQLite file
+    built by build_student_database.py (table: students(id, name, faculty)).
+    Opened with mode=ro so even a bug in this app couldn't write to it.
+    Returns {student_id: {"name":.., "faculty":..}}, or {} if the file is
+    missing (caller handles that -- manual enrollment still works)."""
+    db_map = {}
     if not os.path.exists(path):
-        return db
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb.active
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row or row[0] is None:
-            continue
-        padded = (row + (None,) * 3)[:3]
-        sid, name, faculty = padded
-        sid = str(sid).strip()
-        if not sid:
-            continue
-        db[sid] = {
-            "name": str(name).strip() if name is not None else "",
-            "faculty": str(faculty).strip() if faculty is not None else "",
-        }
-    return db
+        return db_map
+    import sqlite3
+
+    uri = f"file:{os.path.abspath(path)}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            for sid, name, faculty in conn.execute("SELECT id, name, faculty FROM students"):
+                db_map[str(sid).strip()] = {"name": name or "", "faculty": faculty or ""}
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return {}
+    return db_map
 
 
-def load_session_state():
-    if os.path.exists(SESSION_STATE_FILE):
-        with open(SESSION_STATE_FILE, "r", encoding="utf-8") as f:
+def load_device_config():
+    if os.path.exists(DEVICE_CONFIG_FILE):
+        with open(DEVICE_CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"date": None, "next_session_number": 1, "active_session": None}
+    return None
 
 
-def save_session_state(state):
-    with open(SESSION_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+def save_device_config(cfg):
+    with open(DEVICE_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
-def ask_end_session_params(parent, title, initial_instructor="", initial_duration="", initial_hall=None):
-    """Modal dialog for (instructor name, duration in minutes, hall number).
-    Returns (instructor, duration, hall) or None if cancelled."""
+def ask_first_run_setup(root):
+    """Blocking first-run dialog: TA name + controller role. Returns dict."""
+    dialog = tk.Toplevel(root)
+    dialog.title("First-time setup")
+    dialog.transient(root)
+    dialog.grab_set()
+    result = {}
+
+    ttk.Label(dialog, text="Your name (TA):").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
+    name_var = tk.StringVar()
+    ttk.Entry(dialog, textvariable=name_var, width=32).grid(row=1, column=0, padx=10, pady=(0, 10))
+
+    controller_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(
+        dialog, text="This laptop controls sessions (Start/End Session)", variable=controller_var
+    ).grid(row=2, column=0, sticky="w", padx=10, pady=(0, 10))
+    ttk.Label(
+        dialog,
+        text="Only ONE of the two laptops should have this checked.\nThe other TA's laptop will follow along automatically.",
+        justify="left",
+        foreground="gray30",
+    ).grid(row=3, column=0, sticky="w", padx=10, pady=(0, 10))
+
+    def on_ok():
+        if not name_var.get().strip():
+            messagebox.showwarning("Missing name", "Enter your name.", parent=dialog)
+            return
+        result["ta_name"] = name_var.get().strip()
+        result["is_controller"] = controller_var.get()
+        dialog.destroy()
+
+    ttk.Button(dialog, text="Start", command=on_ok).grid(row=4, column=0, pady=(0, 10))
+    dialog.wait_window()
+    return result
+
+
+def ask_end_session_params(parent, title, initial_instructor="", initial_hall=None):
+    """Modal dialog for (instructor name, duration in minutes, hall number)."""
     dialog = tk.Toplevel(parent)
     dialog.title(title)
     dialog.transient(parent)
@@ -142,7 +164,7 @@ def ask_end_session_params(parent, title, initial_instructor="", initial_duratio
     instructor_entry.grid(row=1, column=0, padx=8, pady=(0, 8))
 
     ttk.Label(dialog, text="Session duration (minutes):").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 2))
-    duration_var = tk.StringVar(value=str(initial_duration) if initial_duration != "" else "")
+    duration_var = tk.StringVar()
     duration_entry = ttk.Entry(dialog, textvariable=duration_var, width=32)
     duration_entry.grid(row=3, column=0, padx=8, pady=(0, 8))
 
@@ -198,48 +220,60 @@ def ask_end_session_params(parent, title, initial_instructor="", initial_duratio
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Card Attendance Recorder")
-        self.geometry("780x600")
+        self.withdraw()  # hide until setup is resolved
 
-        self.roster = load_roster()
+        db.init_db(DB_FILE)
         self.student_db = load_student_database()
-        self.last_scan = {}
-        self.last_instructor = ""
-        self.last_hall = None
 
-        self.session_state = load_session_state()
-        today_nodash = datetime.now().strftime("%Y%m%d")
-        if self.session_state.get("date") != today_nodash:
-            if self.session_state.get("active_session"):
-                messagebox.showwarning(
-                    "Unclosed session from a previous day",
-                    f"Session {self.session_state['active_session']['session_id']} was never closed. "
-                    "It's being discarded for today -- review its scans manually if needed.",
-                )
-            self.session_state = {"date": today_nodash, "next_session_number": 1, "active_session": None}
-            save_session_state(self.session_state)
-        self.active_session = self.session_state.get("active_session")
+        cfg = load_device_config()
+        if cfg is None:
+            cfg = ask_first_run_setup(self)
+            if not cfg:
+                self.destroy()
+                return
+            save_device_config(cfg)
+        self.ta_name = cfg["ta_name"]
+        self.is_controller = cfg["is_controller"]
+
+        self.device_info = {"ta_name": self.ta_name, "is_controller": self.is_controller}
+        self.sync_server = sync.start_server(DB_FILE, self.device_info, port=sync.DEFAULT_PORT)
+        self.sync_manager = sync.SyncManager(DB_FILE)
+
+        self.deiconify()
+        self.title(f"Card Attendance Recorder -- {self.ta_name}")
+        self.geometry("820x640")
+
+        self.last_scan = {}
+        self.last_instructor = self.ta_name
+        self.last_hall = None
+        self.current_enroll_uid = None
+        self._warned_both_controller = False
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
         self.attendance_tab = ttk.Frame(self.notebook)
         self.enroll_tab = ttk.Frame(self.notebook)
+        self.sync_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.attendance_tab, text="Attendance")
         self.notebook.add(self.enroll_tab, text="Enroll Cards")
+        self.notebook.add(self.sync_tab, text="Setup & Sync")
 
         self._build_attendance_tab()
         self._build_enroll_tab()
+        self._build_sync_tab()
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        self._update_session_ui()
+        self._refresh_session_ui()
+        self.after(1000, self._poll_background_state)
 
         if not self.student_db:
             messagebox.showinfo(
                 "Student database not found",
                 f"'{STUDENT_DB_FILE}' wasn't found next to this script.\n"
-                "Enroll Cards will still work, just with manual entry only "
-                "(no auto-fill from the university roster).",
+                "If you have students_database.xlsx, run build_student_database.py "
+                "once to convert it, then restart this app.\n\n"
+                "Enroll Cards will still work with manual entry only until then.",
             )
 
     # ---------------- Attendance tab ----------------
@@ -265,7 +299,7 @@ class App(tk.Tk):
         self.att_log = tk.Listbox(frame, font=("Consolas", 11))
         self.att_log.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.att_status = ttk.Label(frame, text=f"Logging to: {ATTENDANCE_FILE}")
+        self.att_status = ttk.Label(frame, text=f"Local database: {DB_FILE}")
         self.att_status.pack(anchor="w", padx=8, pady=(0, 8))
 
     def _on_attendance_scan(self, event):
@@ -275,103 +309,52 @@ class App(tk.Tk):
         if not uid:
             return
 
-        if uid not in self.roster:
+        roster_entry = db.get_roster_entry(uid, db_path=DB_FILE)
+        if roster_entry is None:
             messagebox.showwarning(
                 "Unregistered card",
                 "This card is not registered in the system.\n"
                 "Please add the student in the 'Enroll Cards' tab first.",
             )
             return
-        if not self.active_session:
-            messagebox.showwarning("No active session", "Click 'Start Session' before scanning cards.")
+
+        open_session = db.get_open_session(db_path=DB_FILE)
+        if open_session is None:
+            messagebox.showwarning("No active session", "No session is currently running.")
             return
 
-        self._register_attendance(uid)
+        self._register_attendance(uid, roster_entry, open_session)
 
-    def _register_attendance(self, uid):
-        """Shared by live scans and enroll-time logging. No-op if no session is running."""
-        if not self.active_session:
-            return
-        now = datetime.now()
+    def _register_attendance(self, uid, roster_entry, open_session):
+        now_key = datetime.now()
         last = self.last_scan.get(uid)
-        if last and (now - last).total_seconds() < DEBOUNCE_SECONDS:
+        if last and (now_key - last).total_seconds() < DEBOUNCE_SECONDS:
             return
-        self.last_scan[uid] = now
+        self.last_scan[uid] = now_key
 
-        entry = self.roster.get(uid, {})
-        student_id = entry.get("student_id", "")
-        name = entry.get("name", "UNKNOWN CARD")
-        faculty = entry.get("faculty", "")
-        session_id = self.active_session["session_id"]
+        student_id = roster_entry.get("student_id", "")
+        name = roster_entry.get("name", "UNKNOWN CARD")
+        faculty = roster_entry.get("faculty", "")
+        session_id = open_session["session_id"]
+        ts = db.now_iso()
+        scan_id = f"{self.ta_name}|{uid}|{ts}"
 
-        line = f"{now.strftime('%H:%M:%S')}   {uid}   {student_id:<10}   {name:<20}   [{session_id}]"
+        db.insert_scan(scan_id, uid, student_id, name, faculty, session_id, self.ta_name, db_path=DB_FILE, ts=ts)
+
+        line = f"{datetime.now().strftime('%H:%M:%S')}   {uid}   {student_id:<10}   {name:<20}   [{session_id}]"
         self.att_log.insert(0, line)
-
-        try:
-            self._append_attendance_row(now, uid, student_id, name, faculty, session_id)
-        except PermissionError:
-            messagebox.showerror(
-                "File is open",
-                f"Couldn't save to {ATTENDANCE_FILE} because it's open in Excel.\n"
-                "Close it and the next scan will save normally.",
-            )
-
-    def _append_attendance_row(self, ts, uid, student_id, name, faculty, session_id):
-        if os.path.exists(ATTENDANCE_FILE):
-            wb = openpyxl.load_workbook(ATTENDANCE_FILE)
-        else:
-            wb = openpyxl.Workbook()
-            wb.remove(wb.active)
-
-        sheet_name = ts.strftime("%Y-%m-%d")
-        if sheet_name not in wb.sheetnames:
-            ws = wb.create_sheet(sheet_name)
-            ws.append(
-                ["Time", "UID", "Student ID", "Name", "Faculty", "Session ID", "Hall Number", "TA Name", "Duration (min)"]
-            )
-            widths = {"A": 12, "B": 14, "C": 14, "D": 30, "E": 26, "F": 16, "G": 14, "H": 20, "I": 16}
-            for col, width in widths.items():
-                ws.column_dimensions[col].width = width
-        else:
-            ws = wb[sheet_name]
-
-        # Hall Number / TA Name / Duration are filled in later, at "End Session".
-        ws.append([ts.strftime("%H:%M:%S"), uid, student_id, name, faculty, session_id, None, None, None])
-        wb.save(ATTENDANCE_FILE)
-
-    def _apply_session_metadata(self, session_id, hall, instructor, duration):
-        """Retroactively tag every already-written row of this session with
-        the hall/instructor/duration collected at End Session time."""
-        if not os.path.exists(ATTENDANCE_FILE):
-            return 0
-        wb = openpyxl.load_workbook(ATTENDANCE_FILE)
-        date_str = datetime.strptime(session_id.split("_")[0], "%Y%m%d").strftime("%Y-%m-%d")
-        if date_str not in wb.sheetnames:
-            return 0
-        ws = wb[date_str]
-
-        updated = 0
-        for row in ws.iter_rows(min_row=2):
-            if row[COL_SESSION_ID - 1].value == session_id:
-                row[COL_HALL - 1].value = hall
-                row[COL_TA - 1].value = instructor
-                row[COL_DURATION - 1].value = duration
-                updated += 1
-
-        wb.save(ATTENDANCE_FILE)
-        return updated
 
     # ---------------- Session controls ----------------
     def _start_session(self):
-        if self.active_session:
-            messagebox.showinfo("Session already active", f"Session {self.active_session['session_id']} is already running.")
+        if not self.is_controller:
+            messagebox.showinfo("Helper laptop", "Only the Controller laptop starts sessions.")
+            return
+        if db.get_open_session(db_path=DB_FILE):
+            messagebox.showinfo("Session already active", "A session is already running.")
             return
 
         today_nodash = datetime.now().strftime("%Y%m%d")
-        if self.session_state.get("date") != today_nodash:
-            self.session_state = {"date": today_nodash, "next_session_number": 1, "active_session": None}
-
-        n = self.session_state.get("next_session_number", 1)
+        n = db.highest_session_number(today_nodash, db_path=DB_FILE) + 1
         if n > 5:
             if not messagebox.askyesno(
                 "More than 5 sessions today",
@@ -380,52 +363,56 @@ class App(tk.Tk):
                 return
 
         session_id = f"{today_nodash}_{n}"
-        self.session_state["active_session"] = {"session_id": session_id, "start_time": datetime.now().isoformat()}
-        save_session_state(self.session_state)
-        self.active_session = self.session_state["active_session"]
-        self._update_session_ui()
+        db.start_session(session_id, db_path=DB_FILE)
+        self._refresh_session_ui()
+        self.sync_manager.sync_now()  # push the new session to the partner right away
 
     def _end_session(self):
-        if not self.active_session:
+        if not self.is_controller:
+            messagebox.showinfo("Helper laptop", "Only the Controller laptop ends sessions.")
+            return
+        open_session = db.get_open_session(db_path=DB_FILE)
+        if not open_session:
             messagebox.showinfo("No active session", "There is no session currently running.")
             return
 
-        session_id = self.active_session["session_id"]
-        result = ask_end_session_params(self, f"End Session {session_id}", self.last_instructor, "", self.last_hall)
+        session_id = open_session["session_id"]
+        result = ask_end_session_params(self, f"End Session {session_id}", self.last_instructor, self.last_hall)
         if result is None:
             return
         instructor, duration, hall = result
         self.last_instructor = instructor
         self.last_hall = hall
 
-        updated_rows = self._apply_session_metadata(session_id, hall, instructor, duration)
+        db.close_session(session_id, hall, instructor, duration, db_path=DB_FILE)
+        self._refresh_session_ui()
+        db.export_to_xlsx(db_path=DB_FILE, path=ATTENDANCE_EXPORT_FILE)
+        self.sync_manager.sync_now()  # push the closure to the partner right away
 
-        self.session_state["active_session"] = None
-        self.session_state["next_session_number"] = self.session_state.get("next_session_number", 1) + 1
-        save_session_state(self.session_state)
-        self.active_session = None
-        self._update_session_ui()
-
+        n_scans = sum(1 for s in db.get_all_scans(DB_FILE) if s["session_id"] == session_id)
         messagebox.showinfo(
             "Session closed",
             f"Session {session_id} closed.\n"
             f"Hall: {hall}   TA: {instructor}   Duration: {duration:g} min\n"
-            f"{updated_rows} scan row(s) tagged.\n\n"
-            "Once every hall's file is merged, run attendance_analyzer.py to generate the report.",
+            f"{n_scans} scan row(s) recorded on this laptop (before syncing with the partner).\n\n"
+            "Once every hall's export is merged, run attendance_analyzer.py to generate the report.",
         )
 
-    def _update_session_ui(self):
-        if self.active_session:
-            self.session_status_label.config(text=f"Active session: {self.active_session['session_id']}")
-            self.start_btn.config(state="disabled")
-            self.end_btn.config(state="normal")
+    def _refresh_session_ui(self):
+        open_session = db.get_open_session(db_path=DB_FILE)
+        if open_session:
+            self.session_status_label.config(text=f"Active session: {open_session['session_id']}")
             self.att_entry.config(state="normal")
-            self.att_entry.focus_set()
         else:
             self.session_status_label.config(text="No active session")
-            self.start_btn.config(state="normal")
-            self.end_btn.config(state="disabled")
             self.att_entry.config(state="disabled")
+
+        if self.is_controller:
+            self.start_btn.config(state="disabled" if open_session else "normal")
+            self.end_btn.config(state="normal" if open_session else "disabled")
+        else:
+            self.start_btn.config(state="disabled")
+            self.end_btn.config(state="disabled")
 
     # ---------------- Enroll tab ----------------
     def _build_enroll_tab(self):
@@ -482,7 +469,6 @@ class App(tk.Tk):
         self.enroll_list.pack(fill="both", expand=True, padx=8, pady=8)
         self._refresh_enroll_list()
 
-        self.current_enroll_uid = None
         self.enroll_uid_entry.focus_set()
 
     def _on_enroll_uid_scan(self, event):
@@ -526,13 +512,13 @@ class App(tk.Tk):
             messagebox.showwarning("Missing info", "Student ID, Name, and Faculty are all required.")
             return
 
-        self.roster[uid] = {"student_id": student_id, "name": name, "faculty": faculty}
-        save_roster(self.roster)
+        db.upsert_roster(uid, student_id, name, faculty, db_path=DB_FILE)
         self._refresh_enroll_list()
 
-        if self.active_session:
-            self._register_attendance(uid)
-            note = f"Logged as attendance for session {self.active_session['session_id']}."
+        open_session = db.get_open_session(db_path=DB_FILE)
+        if open_session:
+            self._register_attendance(uid, {"student_id": student_id, "name": name, "faculty": faculty}, open_session)
+            note = f"Logged as attendance for session {open_session['session_id']}."
         else:
             note = "No active session right now, so attendance was not recorded."
         messagebox.showinfo("Student enrolled", f"{name} (ID {student_id}, {faculty}) enrolled.\n{note}")
@@ -547,17 +533,144 @@ class App(tk.Tk):
 
     def _refresh_enroll_list(self):
         self.enroll_list.delete(0, tk.END)
-        for uid, info in self.roster.items():
-            faculty = info.get("faculty", "")
+        for uid, info in db.get_roster(db_path=DB_FILE).items():
             self.enroll_list.insert(
-                tk.END, f"{uid}   ID: {info['student_id']:<10}   {info['name']:<25}   {faculty}"
+                tk.END, f"{uid}   ID: {info['student_id']:<10}   {info['name']:<25}   {info.get('faculty', '')}"
             )
 
+    # ---------------- Setup & Sync tab ----------------
+    def _build_sync_tab(self):
+        frame = self.sync_tab
+
+        info_row = ttk.Frame(frame)
+        info_row.pack(fill="x", padx=8, pady=8)
+        my_ip = sync.get_local_ip()
+        ttk.Label(
+            info_row,
+            text=f"This laptop -- TA: {self.ta_name}   |   My address: {my_ip}:{sync.DEFAULT_PORT}",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+
+        self.controller_var = tk.BooleanVar(value=self.is_controller)
+        ttk.Checkbutton(
+            frame,
+            text="This laptop controls sessions (Start/End Session)",
+            variable=self.controller_var,
+            command=self._on_controller_toggle,
+        ).pack(anchor="w", padx=8, pady=(4, 8))
+        ttk.Label(
+            frame,
+            text="Only one laptop should have this checked. If the Controller's laptop has a\n"
+            "problem, the other TA can check this box here to take over for the rest of the day.",
+            justify="left",
+            foreground="gray30",
+        ).pack(anchor="w", padx=8, pady=(0, 12))
+
+        ttk.Separator(frame).pack(fill="x", padx=8, pady=4)
+
+        connect_row = ttk.Frame(frame)
+        connect_row.pack(fill="x", padx=8, pady=8)
+        ttk.Label(connect_row, text="Partner's address (shown on their screen):", width=32).pack(side="left")
+        self.peer_ip_var = tk.StringVar()
+        ttk.Entry(connect_row, textvariable=self.peer_ip_var, width=18).pack(side="left")
+        ttk.Label(connect_row, text=f":{sync.DEFAULT_PORT}").pack(side="left")
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btn_row, text="Connect & Start Syncing", command=self._on_connect).pack(side="left")
+        ttk.Button(btn_row, text="Sync Now", command=self._on_sync_now).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Disconnect", command=self._on_disconnect).pack(side="left", padx=(6, 0))
+
+        self.sync_status_label = ttk.Label(frame, text="Not connected", foreground="gray30")
+        self.sync_status_label.pack(anchor="w", padx=8, pady=(4, 12))
+
+        ttk.Separator(frame).pack(fill="x", padx=8, pady=4)
+
+        ttk.Button(frame, text="Export attendance_logger.xlsx now", command=self._on_manual_export).pack(
+            anchor="w", padx=8, pady=8
+        )
+        ttk.Label(
+            frame,
+            text="(Also happens automatically after every successful sync and after End Session,\n"
+            "so the export file is always close to current if you need it mid-class.)",
+            justify="left",
+            foreground="gray30",
+        ).pack(anchor="w", padx=8)
+
+    def _on_controller_toggle(self):
+        self.is_controller = self.controller_var.get()
+        self.device_info["is_controller"] = self.is_controller
+        cfg = {"ta_name": self.ta_name, "is_controller": self.is_controller}
+        save_device_config(cfg)
+        self._refresh_session_ui()
+        self._warned_both_controller = False
+
+    def _on_connect(self):
+        peer_ip = self.peer_ip_var.get().strip()
+        if not peer_ip:
+            messagebox.showwarning("Missing address", "Enter the partner laptop's address first.")
+            return
+        peer_url = f"http://{peer_ip}:{sync.DEFAULT_PORT}"
+        try:
+            reply = sync.ping(peer_url, timeout=4)
+        except Exception as e:
+            messagebox.showerror(
+                "Couldn't reach partner",
+                f"Could not reach {peer_ip}.\n\n"
+                "Make sure both laptops are connected to the same mobile hotspot, "
+                "the partner's app is running, and the address is typed correctly.\n\n"
+                f"Details: {e}",
+            )
+            return
+        if not reply.get("ok"):
+            messagebox.showerror("Couldn't reach partner", "Partner responded unexpectedly. Try again.")
+            return
+
+        self.sync_manager.start(peer_url, interval_seconds=SYNC_INTERVAL_SECONDS)
+        self.sync_status_label.config(text=f"Connected to {peer_ip} -- syncing every {SYNC_INTERVAL_SECONDS}s", foreground="green")
+
+    def _on_sync_now(self):
+        if not self.sync_manager.peer_base_url:
+            messagebox.showinfo("Not connected", "Click 'Connect & Start Syncing' first.")
+            return
+        self.sync_manager.sync_now()
+        self._apply_sync_status()
+
+    def _on_disconnect(self):
+        self.sync_manager.stop()
+        self.sync_status_label.config(text="Not connected", foreground="gray30")
+
+    def _on_manual_export(self):
+        db.export_to_xlsx(db_path=DB_FILE, path=ATTENDANCE_EXPORT_FILE)
+        messagebox.showinfo("Exported", f"Saved {ATTENDANCE_EXPORT_FILE}")
+
+    # ---------------- Background state polling (main thread only) --------
+    def _poll_background_state(self):
+        self._apply_sync_status()
+        self._refresh_session_ui()
+        self._refresh_enroll_list()
+        self.after(1000, self._poll_background_state)
+
+    def _apply_sync_status(self):
+        status = self.sync_manager.last_status
+        color = "green" if status.lower().startswith("[") and "fail" not in status.lower() else "red"
+        if self.sync_manager.peer_base_url is None:
+            color = "gray30"
+        self.sync_status_label.config(text=status, foreground=color)
+
+        remote_info = self.sync_manager.last_remote_device_info
+        if remote_info and remote_info.get("is_controller") and self.is_controller and not self._warned_both_controller:
+            self._warned_both_controller = True
+            messagebox.showwarning(
+                "Both laptops set as Controller",
+                "Your partner's laptop is also set to control sessions.\n"
+                "Please uncheck it on one of the two laptops to avoid mismatched Session IDs.",
+            )
+
+        if self.sync_manager.peer_base_url:
+            db.export_to_xlsx(db_path=DB_FILE, path=ATTENDANCE_EXPORT_FILE)
+
     # ---------------- Focus management ----------------
-    # Focus is set explicitly right after actions that need it (a scan
-    # processed, a session started, a tab switched) instead of a recurring
-    # timer -- a polling timer was fighting with the Hall/Faculty dropdowns,
-    # yanking focus back and closing them before a click could register.
     def _on_tab_changed(self, event=None):
         try:
             current_tab = self.nametowidget(self.notebook.select())
@@ -570,4 +683,5 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    app = App()
+    app.mainloop()
