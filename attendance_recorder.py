@@ -72,7 +72,7 @@ TYPICAL_SESSION_RANGE = (45, 90)  # minutes; soft sanity check only
 SYNC_INTERVAL_SECONDS = 12
 
 # TODO: replace with the official list of halls once provided.
-HALL_LIST = ["Hall 1", "Hall 2", "Hall 3"]
+HALL_LIST = ["A.020", "A.128", "A.228", "A.328", "A.428"]
 
 FACULTY_LIST = [
     "Biotechnology",
