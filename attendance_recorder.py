@@ -249,8 +249,9 @@ class App(tk.Tk):
         self.is_controller = cfg["is_controller"]
 
         self.device_info = {"ta_name": self.ta_name, "is_controller": self.is_controller}
-        self.sync_server = sync.start_server(DB_FILE, self.device_info, port=sync.DEFAULT_PORT)
-        self.sync_manager = sync.SyncManager(DB_FILE)
+        self.sync_status = sync.SyncStatus()
+        self.sync_server = sync.start_server(DB_FILE, self.device_info, self.sync_status, port=sync.DEFAULT_PORT)
+        self.sync_manager = sync.SyncManager(DB_FILE, self.sync_status, device_info=self.device_info)
 
         self.title(f"Card Attendance Recorder -- {self.ta_name}")
         self.geometry("820x640")
@@ -580,12 +581,14 @@ class App(tk.Tk):
 
         ttk.Separator(frame).pack(fill="x", padx=8, pady=4)
 
+        ttk.Label(frame, text="Partner's address (shown on their screen):").pack(
+            anchor="w", padx=8, pady=(8, 2)
+        )
         connect_row = ttk.Frame(frame)
-        connect_row.pack(fill="x", padx=8, pady=8)
-        ttk.Label(connect_row, text="Partner's address (shown on their screen):", width=32).pack(side="left")
+        connect_row.pack(fill="x", padx=8, pady=(0, 8))
         self.peer_ip_var = tk.StringVar()
         ttk.Entry(connect_row, textvariable=self.peer_ip_var, width=18).pack(side="left")
-        ttk.Label(connect_row, text=f":{sync.DEFAULT_PORT}").pack(side="left")
+        ttk.Label(connect_row, text=f":{sync.DEFAULT_PORT}").pack(side="left", padx=(4, 0))
 
         btn_row = ttk.Frame(frame)
         btn_row.pack(fill="x", padx=8, pady=(0, 8))
@@ -639,7 +642,7 @@ class App(tk.Tk):
             return
 
         self.sync_manager.start(peer_url, interval_seconds=SYNC_INTERVAL_SECONDS)
-        self.sync_status_label.config(text=f"Connected to {peer_ip} -- syncing every {SYNC_INTERVAL_SECONDS}s", foreground="green")
+        self.sync_status.set(f"Connecting to {peer_ip}...")
 
     def _on_sync_now(self):
         if not self.sync_manager.peer_base_url:
@@ -650,7 +653,7 @@ class App(tk.Tk):
 
     def _on_disconnect(self):
         self.sync_manager.stop()
-        self.sync_status_label.config(text="Not connected", foreground="gray30")
+        self.sync_status.set("Not connected")
 
     def _on_manual_export(self):
         db.export_to_xlsx(db_path=DB_FILE, path=ATTENDANCE_EXPORT_FILE)
@@ -664,13 +667,15 @@ class App(tk.Tk):
         self.after(1000, self._poll_background_state)
 
     def _apply_sync_status(self):
-        status = self.sync_manager.last_status
-        color = "green" if status.lower().startswith("[") and "fail" not in status.lower() else "red"
-        if self.sync_manager.peer_base_url is None:
+        text, last_activity_ts, remote_info = self.sync_status.get()
+        if self.sync_status.is_live():
+            color = "green"
+        elif "fail" in text.lower() or "could not reach" in text.lower() or "error" in text.lower():
+            color = "red"
+        else:
             color = "gray30"
-        self.sync_status_label.config(text=status, foreground=color)
+        self.sync_status_label.config(text=text, foreground=color)
 
-        remote_info = self.sync_manager.last_remote_device_info
         if remote_info and remote_info.get("is_controller") and self.is_controller and not self._warned_both_controller:
             self._warned_both_controller = True
             messagebox.showwarning(
@@ -679,7 +684,7 @@ class App(tk.Tk):
                 "Please uncheck it on one of the two laptops to avoid mismatched Session IDs.",
             )
 
-        if self.sync_manager.peer_base_url:
+        if self.sync_status.is_live():
             db.export_to_xlsx(db_path=DB_FILE, path=ATTENDANCE_EXPORT_FILE)
 
     # ---------------- Focus management ----------------
