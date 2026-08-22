@@ -64,18 +64,43 @@ class SyncStatus:
 
 
 def get_local_ip():
-    """Best-effort local network IP. Uses a UDP 'connect' (no packets sent,
-    just asks the OS routing table which interface would be used) so it
-    works even with zero internet access -- exactly the hotspot scenario."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    """Best-effort local network IP. Tries a UDP 'connect' to a well-known
+    PUBLIC address (8.8.8.8) purely so the OS routing table picks the
+    right outbound interface -- no packets are actually sent, so this
+    works with zero internet access. Deliberately NOT a hotspot-vendor-
+    specific gateway guess: an earlier version probed 192.168.137.1
+    specifically, which is only correct when THIS laptop is itself
+    hosting a Windows Mobile Hotspot. When both laptops are simply
+    clients on a phone's hotspot (the actual real-world setup here),
+    that address usually isn't routable, and the probe would silently
+    fall back to the useless "127.0.0.1" -- a loopback address that
+    looks like a normal IP but is unreachable from another machine.
+    Falls back to hostname-based resolution if the primary trick fails
+    for any reason. Only returns "127.0.0.1" as an absolute last resort;
+    callers should treat that value as broken, not as a valid address."""
+    candidates = []
+
     try:
-        s.connect(("192.168.137.1", 80))  # typical Windows Mobile Hotspot gateway; doesn't need to respond
-        ip = s.getsockname()[0]
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            candidates.append(s.getsockname()[0])
+        finally:
+            s.close()
     except OSError:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
+        pass
+
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            candidates.append(ip)
+    except OSError:
+        pass
+
+    for ip in candidates:
+        if ip and ip != "127.0.0.1":
+            return ip
+
+    return "127.0.0.1"
 
 
 def _make_handler(db_path, device_info, status):

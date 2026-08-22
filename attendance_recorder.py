@@ -558,11 +558,26 @@ class App(tk.Tk):
         info_row = ttk.Frame(frame)
         info_row.pack(fill="x", padx=8, pady=8)
         my_ip = sync.get_local_ip()
-        ttk.Label(
+        ip_broken = my_ip == "127.0.0.1"
+        self.my_ip_label = ttk.Label(
             info_row,
-            text=f"This laptop -- TA: {self.ta_name}   |   My address: {my_ip}:{sync.DEFAULT_PORT}",
+            text=f"This laptop -- TA: {self.ta_name}   |   My address: {my_ip}:{sync.DEFAULT_PORT}"
+            + ("   (COULD NOT DETECT -- see warning)" if ip_broken else ""),
             font=("Segoe UI", 10, "bold"),
-        ).pack(anchor="w")
+            foreground="red" if ip_broken else "black",
+        )
+        self.my_ip_label.pack(anchor="w")
+        if ip_broken:
+            messagebox.showwarning(
+                "Couldn't detect network address",
+                "This laptop's network address could not be detected automatically -- it's "
+                "showing 127.0.0.1, which only works on this same machine and can't be used "
+                "by the partner laptop to connect.\n\n"
+                "Make sure Wi-Fi is connected to the mobile hotspot, then close and reopen "
+                "this app. If it keeps happening, find this laptop's IPv4 address manually "
+                "(Windows: run 'ipconfig' in a terminal and look for the address under the "
+                "Wi-Fi adapter) and give that to your partner instead.",
+            )
 
         self.controller_var = tk.BooleanVar(value=self.is_controller)
         ttk.Checkbutton(
@@ -632,8 +647,16 @@ class App(tk.Tk):
             messagebox.showerror(
                 "Couldn't reach partner",
                 f"Could not reach {peer_ip}.\n\n"
-                "Make sure both laptops are connected to the same mobile hotspot, "
-                "the partner's app is running, and the address is typed correctly.\n\n"
+                "This is a timeout, not a rejection -- something between the two laptops is "
+                "silently dropping the connection rather than refusing it. Most commonly:\n\n"
+                "1. Both laptops aren't actually on the same hotspot yet (check Wi-Fi on both).\n"
+                "2. The address was mistyped, or is showing 127.0.0.1 on the OTHER laptop's "
+                "screen (that means THEIR detection failed -- see the warning on their app).\n"
+                "3. Windows Firewall is blocking inbound connections on the PARTNER's laptop -- "
+                "very common right after joining a new network for the first time. On the "
+                "partner's laptop: confirm the hotspot network is set to 'Private' (not "
+                "'Public') under Wi-Fi settings, and check for an unanswered "
+                "'Windows Defender Firewall blocked some features of this app' prompt.\n\n"
                 f"Details: {e}",
             )
             return
