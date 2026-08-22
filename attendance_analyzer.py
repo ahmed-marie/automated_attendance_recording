@@ -316,6 +316,16 @@ def _write_date_sheet(wb, date_str, rows, ordered_ids, hall_durations):
         col += 2
 
 
+def default_report_filename(dates):
+    """Same naming convention used by both the CLI and the GUI, so there's
+    one place that decides it: 'attendance_report_<date>.xlsx' for a single
+    date, or '..._<first>_to_<last>.xlsx' for a range."""
+    dates = sorted(dates)
+    if len(dates) == 1:
+        return f"{REPORT_PREFIX}{dates[0]}.xlsx"
+    return f"{REPORT_PREFIX}{dates[0]}_to_{dates[-1]}.xlsx"
+
+
 def generate_full_report(recorder_path, roster, dates=None, report_path=None):
     """One workbook, one sheet per date, sheets in chronological order.
     Pass dates=[single_date] to report just that one date."""
@@ -338,7 +348,7 @@ def generate_full_report(recorder_path, roster, dates=None, report_path=None):
         dates = available_dates
 
     if report_path is None:
-        report_path = f"{REPORT_PREFIX}{dates[0]}.xlsx" if len(dates) == 1 else f"{REPORT_PREFIX}{dates[0]}_to_{dates[-1]}.xlsx"
+        report_path = default_report_filename(dates)
 
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
