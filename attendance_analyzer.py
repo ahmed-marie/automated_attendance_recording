@@ -27,6 +27,11 @@ most common value entered for that session_id, across all its rows/halls)
 -- there's no separate metadata file to keep in sync, so re-running this
 script after fixing a cell in Excel is all "re-evaluating" requires.
 
+A student's roster info (for labeling, and for catching students who
+never scanned at all) comes from the "Roster" sheet inside the SAME merged
+attendance_logger.xlsx -- there's no separate roster.json to keep in sync;
+attendance_recorder.py's export writes that sheet automatically.
+
 Requirements:
     pip install openpyxl
 
@@ -36,7 +41,6 @@ Usage:
 """
 
 import argparse
-import json
 import os
 from collections import Counter
 from datetime import datetime
@@ -44,7 +48,6 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 
 ATTENDANCE_FILE_DEFAULT = "attendance_logger.xlsx"
-ROSTER_FILE = "roster.json"
 REPORT_PREFIX = "attendance_report_"
 
 # A student must be inside the hall for at least this fraction of the
@@ -52,11 +55,27 @@ REPORT_PREFIX = "attendance_report_"
 ATTENDANCE_RATIO = 0.75
 
 
-def load_roster(path=ROSTER_FILE):
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def load_roster(recorder_path):
+    """Read the 'Roster' sheet (Card UID | Student ID | Name | Faculty)
+    from the merged attendance_logger.xlsx. Returns {} if the file or that
+    sheet doesn't exist -- older exports without the sheet still work, they
+    just can't show fully-absent (zero-scan) students."""
+    roster = {}
+    if not os.path.exists(recorder_path):
+        return roster
+    wb = openpyxl.load_workbook(recorder_path, data_only=True)
+    if "Roster" not in wb.sheetnames:
+        return roster
+    ws = wb["Roster"]
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or row[0] is None:
+            continue
+        uid, student_id, name, faculty = (row + (None,) * 4)[:4]
+        uid = str(uid).strip()
+        if not uid:
+            continue
+        roster[uid] = {"student_id": student_id or uid, "name": name or "", "faculty": faculty or ""}
+    return roster
 
 
 def session_number(session_id):
@@ -224,7 +243,7 @@ def main():
     if not os.path.exists(args.input):
         raise SystemExit(f"Input file not found: {args.input}")
 
-    roster = load_roster()
+    roster = load_roster(args.input)
     report_path, rows, ordered_ids, warnings = generate_report(args.input, args.date, roster, args.output)
 
     counts = {}

@@ -41,7 +41,7 @@ Files used/created next to this script:
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 import json
 import os
 import sys
